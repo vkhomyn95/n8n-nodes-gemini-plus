@@ -120,7 +120,10 @@ export async function baseAnalyze(
 	if (options.maxOutputTokens !== undefined) {
 		generationConfig.max_output_tokens = options.maxOutputTokens as number;
 	}
-	if (options.thinkingLevel) {
+
+	const supportsThinkingLevel = /^gemini-3/.test(model);
+
+	if (options.thinkingLevel && supportsThinkingLevel) {
 		generationConfig.thinking_level = options.thinkingLevel as string;
 	}
 

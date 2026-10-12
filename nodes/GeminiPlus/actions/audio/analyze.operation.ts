@@ -89,7 +89,7 @@ const properties: INodeProperties[] = [
 				name: 'thinkingLevel',
 				type: 'options',
 				default: 'medium',
-				description: 'Configuration for dynamic thinking behavior (default is Medium)',
+				description: 'Configuration for dynamic thinking behavior (default is Medium). Used only for Gemini 3 models',
 				options: [
 					{ name: 'Low', value: 'low' },
 					{ name: 'Medium', value: 'medium' },
