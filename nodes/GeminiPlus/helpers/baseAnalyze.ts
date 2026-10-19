@@ -7,86 +7,17 @@ import {
 } from 'n8n-workflow';
 
 import type {
-	Interaction,
 	InteractionContent,
 	InteractionGenerationConfig,
 } from './interfaces';
+import {
+	createInteraction,
+	getOutputText,
+	toInteractionContent,
+	toInteractionModel,
+} from './interactions';
 import { downloadFile, uploadFile } from './utils';
 import { apiRequest } from '../transport';
-
-type MediaType = 'image' | 'audio' | 'video' | 'document';
-
-function getMediaType(mimeType: string): MediaType {
-	if (mimeType.startsWith('image/')) return 'image';
-	if (mimeType.startsWith('audio/')) return 'audio';
-	if (mimeType.startsWith('video/')) return 'video';
-	return 'document';
-}
-
-function toInteractionContent(uri: string, mimeType: string): InteractionContent {
-	// У SDK mime_type — вузький union для кожного типу (в ранніх 2.x без `string`),
-	// а API приймає будь-який підтримуваний mime, тому тут свідомий cast.
-	return { type: getMediaType(mimeType), uri, mime_type: mimeType } as InteractionContent;
-}
-
-/**
- * Перетворює відповідь Interactions API у формат generateContent:
- * candidates / usageMetadata / modelVersion / responseId.
- *
- * Назви полів `usage.*` взято з beta-схеми Interactions API. Якщо щось не збігається —
- * тимчасово поверніть сиру відповідь і перевірте реальні назви.
- */
-function toLegacyResponse(response: Interaction): IDataObject {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const r = response as any;
-	const u = r.usage ?? {};
-
-	// Усі текстові частини з усіх model_output кроків зливаємо в одного candidate
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const parts = (r.steps ?? [])
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		.filter((s: any) => s.type === 'model_output')
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		.flatMap((s: any) =>
-			(s.content ?? [])
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				.filter((c: any) => c.type === 'text')
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				.map((c: any) => ({ text: c.text })),
-		);
-
-	const finishReasonMap: Record<string, string> = {
-		completed: 'STOP',
-		incomplete: 'MAX_TOKENS',
-		failed: 'OTHER',
-	};
-
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const promptTokensDetails = (u.input_tokens_by_modality ?? []).map((m: any) => ({
-		modality: String(m.modality).toUpperCase(),
-		tokenCount: m.tokens ?? m.token_count ?? 0,
-	}));
-
-	return {
-		candidates: [
-			{
-				content: { parts, role: 'model' },
-				finishReason: finishReasonMap[r.status] ?? 'STOP',
-				index: 0,
-			},
-		],
-		usageMetadata: {
-			promptTokenCount: u.total_input_tokens ?? 0,
-			candidatesTokenCount: u.total_output_tokens ?? 0,
-			totalTokenCount: u.total_tokens ?? 0,
-			promptTokensDetails,
-			thoughtsTokenCount: u.total_thought_tokens ?? 0,
-			serviceTier: r.service_tier ?? 'standard',
-		},
-		modelVersion: r.model,
-		responseId: r.id,
-	};
-}
 
 export async function baseAnalyze(
 	this: IExecuteFunctions,
@@ -95,8 +26,7 @@ export async function baseAnalyze(
 	fallbackMimeType: string,
 ): Promise<INodeExecutionData[]> {
 	const rawModel = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
-	// Раніше було "models/gemini-..." (для URL), в Interactions API потрібен просто
-	const model = rawModel.replace(/^models\//, '');
+	const model = toInteractionModel(rawModel);
 
 	const inputType = this.getNodeParameter('inputType', i, 'url') as string;
 	const text = this.getNodeParameter('text', i, '') as string;
@@ -177,28 +107,11 @@ export async function baseAnalyze(
 		...(Object.keys(generationConfig).length ? { generation_config: generationConfig } : {}),
 	};
 
-	const response = (await apiRequest.call(this, 'POST', '/v1beta/interactions', {
-		body: body as unknown as IDataObject,
-	})) as Interaction;
-
-	// Відладка: щоб побачити сиру відповідь API, тимчасово розкоментуйте
-	// return [{ json: response as unknown as IDataObject, pairedItem: { item: i } }];
-
-	const legacy = toLegacyResponse(response);
+	const response = await createInteraction.call(this, body as unknown as IDataObject);
 
 	if (simplify) {
-		// Як у старій ноді: лише content першого кандидата.
-		// Вирази на кшталт {{ $json.content.parts[0].text }} продовжують працювати.
-		return [
-			{
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				json: { content: (legacy.candidates as any[])[0].content },
-				pairedItem: { item: i },
-			},
-		];
+		return [{ json: { text: getOutputText(response) }, pairedItem: { item: i } }];
 	}
 
-	// Без simplify — той самий вигляд, що на скріншоті:
-	// candidates, usageMetadata, modelVersion, responseId
-	return [{ json: legacy, pairedItem: { item: i } }];
+	return [{ json: response as unknown as IDataObject, pairedItem: { item: i } }];
 }

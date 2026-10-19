@@ -1,11 +1,18 @@
-import type { IExecuteFunctions, INodeExecutionData, INodeProperties } from 'n8n-workflow';
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
+	INodeProperties,
+} from 'n8n-workflow';
 import { updateDisplayOptions } from 'n8n-workflow';
 
-import type {
-	Content,
-	GenerateContentRequest,
-	GenerateContentResponse,
-} from '../../helpers/interfaces';
+import {
+	createInteraction,
+	getOutputText,
+	toInteractionContent,
+	toInteractionModel,
+} from '../../helpers/interactions';
+import type { InteractionContent } from '../../helpers/interfaces';
 import { downloadFile, uploadFile } from '../../helpers/utils';
 import { apiRequest } from '../../transport';
 import { modelRLC } from '../descriptions';
@@ -100,12 +107,13 @@ const displayOptions = {
 export const description = updateDisplayOptions(displayOptions, properties);
 
 export async function execute(this: IExecuteFunctions, i: number): Promise<INodeExecutionData[]> {
-	const model = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
+	const rawModel = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
+	const model = toInteractionModel(rawModel);
 	const inputType = this.getNodeParameter('inputType', i, 'url') as string;
 	const simplify = this.getNodeParameter('simplify', i, true) as boolean;
 	const options = this.getNodeParameter('options', i, {});
 
-	let contents: Content[];
+	let filesData: Array<{ fileUri: string; mimeType: string }>;
 	if (inputType === 'url') {
 		const urls = this.getNodeParameter('audioUrls', i, '') as string;
 		const filesDataPromises = urls
@@ -124,15 +132,7 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 				}
 			});
 
-		const filesData = await Promise.all(filesDataPromises);
-		contents = [
-			{
-				role: 'user',
-				parts: filesData.map((fileData) => ({
-					fileData,
-				})),
-			},
-		];
+		filesData = await Promise.all(filesDataPromises);
 	} else {
 		const binaryPropertyNames = this.getNodeParameter('binaryPropertyName', i, 'data');
 		const promises = binaryPropertyNames
@@ -145,41 +145,23 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 				return await uploadFile.call(this, buffer, binaryData.mimeType);
 			});
 
-		const filesData = await Promise.all(promises);
-		contents = [
-			{
-				role: 'user',
-				parts: filesData.map((fileData) => ({
-					fileData,
-				})),
-			},
-		];
+		filesData = await Promise.all(promises);
 	}
 
 	const text = `Generate a transcript of the speech${
 		options.startTime ? ` from ${options.startTime as string}` : ''
 	}${options.endTime ? ` to ${options.endTime as string}` : ''}`;
-	contents[0].parts.push({ text });
 
-	const body: GenerateContentRequest = {
-		contents,
-	};
+	const input: InteractionContent[] = [
+		...filesData.map((f) => toInteractionContent(f.fileUri, f.mimeType)),
+		{ type: 'text', text },
+	];
 
-	const response = (await apiRequest.call(this, 'POST', `/v1beta/${model}:generateContent`, {
-		body,
-	})) as GenerateContentResponse;
+	const response = await createInteraction.call(this, { model, input } as unknown as IDataObject);
 
 	if (simplify) {
-		return response.candidates.map((candidate) => ({
-			json: candidate,
-			pairedItem: { item: i },
-		}));
+		return [{ json: { text: getOutputText(response) }, pairedItem: { item: i } }];
 	}
 
-	return [
-		{
-			json: { ...response },
-			pairedItem: { item: i },
-		},
-	];
+	return [{ json: response as unknown as IDataObject, pairedItem: { item: i } }];
 }

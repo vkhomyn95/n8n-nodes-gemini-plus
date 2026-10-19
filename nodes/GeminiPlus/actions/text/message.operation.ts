@@ -11,18 +11,19 @@ import {
 } from 'n8n-workflow';
 
 import { getConnectedTools, toGeminiParameters } from '../../helpers/connectedTools';
-
+import {
+	createInteraction,
+	getOutputText,
+	toInteractionModel,
+} from '../../helpers/interactions';
 import type {
-	GenerateContentRequest,
-	GenerateContentResponse,
-	Content,
-	Tool,
-	GenerateContentGenerationConfig,
 	BuiltInTools,
-	FunctionCallPart,
-	TextPart,
+	Interaction,
+	InteractionGenerationConfig,
+	InteractionStep,
+	InteractionTextContent,
+	InteractionTool,
 } from '../../helpers/interfaces';
-import { apiRequest } from '../../transport';
 import { modelRLC } from '../descriptions';
 
 const properties: INodeProperties[] = [
@@ -195,19 +196,6 @@ const properties: INodeProperties[] = [
 		default: {},
 		options: [
 			{
-				displayName: 'Include Merged Response',
-				name: 'includeMergedResponse',
-				type: 'boolean',
-				default: false,
-				description:
-					'Whether to include a single output string merging all text parts of the response',
-				displayOptions: {
-					show: {
-						'@version': [{ _cnd: { gte: 1.1 } }],
-					},
-				},
-			},
-			{
 				displayName: 'System Message',
 				name: 'systemMessage',
 				type: 'string',
@@ -228,19 +216,6 @@ const properties: INodeProperties[] = [
 				},
 			},
 			{
-				displayName: 'Frequency Penalty',
-				name: 'frequencyPenalty',
-				default: 0,
-				description:
-					"Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim",
-				type: 'number',
-				typeOptions: {
-					minValue: -2,
-					maxValue: 2,
-					numberPrecision: 1,
-				},
-			},
-			{
 				displayName: 'Maximum Number of Tokens',
 				name: 'maxOutputTokens',
 				default: 16,
@@ -249,31 +224,6 @@ const properties: INodeProperties[] = [
 				typeOptions: {
 					minValue: 1,
 					numberPrecision: 0,
-				},
-			},
-			{
-				displayName: 'Number of Completions',
-				name: 'candidateCount',
-				default: 1,
-				description: 'How many completions to generate for each prompt',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-					maxValue: 8, // Google Gemini supports up to 8 candidates
-					numberPrecision: 0,
-				},
-			},
-			{
-				displayName: 'Presence Penalty',
-				name: 'presencePenalty',
-				default: 0,
-				description:
-					"Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics",
-				type: 'number',
-				typeOptions: {
-					minValue: -2,
-					maxValue: 2,
-					numberPrecision: 1,
 				},
 			},
 			{
@@ -302,35 +252,24 @@ const properties: INodeProperties[] = [
 				},
 			},
 			{
-				displayName: 'Output Randomness (Top K)',
-				name: 'topK',
-				default: 1,
-				description: 'The maximum number of tokens to consider when sampling',
-				type: 'number',
-				typeOptions: {
-					minValue: 1,
-					numberPrecision: 0,
-				},
-			},
-			{
-				displayName: 'Thinking Budget',
-				name: 'thinkingBudget',
-				type: 'number',
-				default: -1,
-				description:
-					'Controls reasoning tokens for thinking models. Set to 0 to disable automatic thinking. Set to -1 for dynamic thinking (default).',
-				typeOptions: {
-					minValue: -1,
-					numberPrecision: 0,
-				},
+				displayName: 'Thinking Level',
+				name: 'thinkingLevel',
+				type: 'options',
+				default: 'medium',
+				description: 'Configuration for dynamic thinking behavior (default is Medium). Used only for Gemini 3 models',
+				options: [
+					{ name: 'Minimal', value: 'minimal' },
+					{ name: 'Low', value: 'low' },
+					{ name: 'Medium', value: 'medium' },
+					{ name: 'High', value: 'high' },
+				],
 			},
 			{
 				displayName: 'Max Tool Calls Iterations',
 				name: 'maxToolsIterations',
 				type: 'number',
 				default: 15,
-				description:
-					'The maximum number of tool iteration cycles the LLM will run before stopping. A single iteration can contain multiple tool calls. Set to 0 for no limit',
+				description: 'The maximum number of tool iteration cycles the LLM will run before stopping. A single iteration can contain multiple tool calls. Set to 0 for no limit',
 				typeOptions: {
 					minValue: 0,
 					numberPrecision: 0,
@@ -349,20 +288,17 @@ const displayOptions = {
 
 export const description = updateDisplayOptions(displayOptions, properties);
 
-function isFunctionCallPart(part: unknown): part is FunctionCallPart {
-	return !!part && typeof part === 'object' && 'functionCall' in part;
-}
 
-function isTextPart(part: unknown): part is TextPart {
-	return !!part && typeof part === 'object' && 'text' in part;
-}
+type FunctionCallStep = Extract<InteractionStep, { type: 'function_call' }>;
+type FunctionResultStep = Extract<InteractionStep, { type: 'function_result' }>;
 
-function getToolCalls(response: GenerateContentResponse) {
-	return response.candidates.flatMap((c) => c?.content?.parts ?? []).filter(isFunctionCallPart);
+function getToolCalls(response: Interaction): FunctionCallStep[] {
+	return (response.steps ?? []).filter((s): s is FunctionCallStep => s.type === 'function_call');
 }
 
 export async function execute(this: IExecuteFunctions, i: number): Promise<INodeExecutionData[]> {
-	const model = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
+	const rawModel = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
+	const model = toInteractionModel(rawModel);
 	const messages = this.getNodeParameter('messages.values', i, []) as Array<{
 		content: string;
 		role: string;
@@ -374,105 +310,70 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 	validateNodeParameters(
 		options,
 		{
-			includeMergedResponse: { type: 'boolean', required: false },
 			systemMessage: { type: 'string', required: false },
 			codeExecution: { type: 'boolean', required: false },
-			frequencyPenalty: { type: 'number', required: false },
 			maxOutputTokens: { type: 'number', required: false },
-			candidateCount: { type: 'number', required: false },
-			presencePenalty: { type: 'number', required: false },
 			temperature: { type: 'number', required: false },
 			topP: { type: 'number', required: false },
-			topK: { type: 'number', required: false },
-			thinkingBudget: { type: 'number', required: false },
+			thinkingLevel: { type: 'string', required: false },
 			maxToolsIterations: { type: 'number', required: false },
 		},
 		this.getNode(),
 	);
 
-	const generationConfig: GenerateContentGenerationConfig = {
-		frequencyPenalty: options.frequencyPenalty,
-		maxOutputTokens: options.maxOutputTokens,
-		candidateCount: options.candidateCount,
-		presencePenalty: options.presencePenalty,
-		temperature: options.temperature,
-		topP: options.topP,
-		topK: options.topK,
-		responseMimeType: jsonOutput ? 'application/json' : undefined,
-	};
-
-	// Add thinkingConfig if thinkingBudget is specified
-	if (options.thinkingBudget !== undefined) {
-		generationConfig.thinkingConfig = {
-			thinkingBudget: options.thinkingBudget,
-		};
+	// frequencyPenalty / presencePenalty / topK / candidateCount / thinkingBudget
+	// в Interactions API відсутні, тому з опцій їх прибрано
+	const generationConfig: InteractionGenerationConfig = {};
+	if (options.maxOutputTokens !== undefined) {
+		generationConfig.max_output_tokens = options.maxOutputTokens;
+	}
+	if (options.temperature !== undefined) {
+		generationConfig.temperature = options.temperature;
+	}
+	if (options.topP !== undefined) {
+		generationConfig.top_p = options.topP;
+	}
+	if (options.thinkingLevel && /^gemini-3/.test(model)) {
+		generationConfig.thinking_level = options.thinkingLevel;
 	}
 
 	const nodeInputs = this.getNodeInputs();
 	const availableTools = nodeInputs.some((i) => i.type === 'ai_tool')
 		? await getConnectedTools(this, true)
 		: [];
-	const tools: Tool[] = [
-		{
-			functionDeclarations: availableTools.map((t) => ({
-				name: t.name,
-				description: t.description,
-				parameters: toGeminiParameters(t.schema),
-			})),
-		},
-	];
-	if (!tools[0].functionDeclarations?.length) {
-		tools.pop();
-	}
+	const tools = availableTools.map((t): InteractionTool => ({
+		type: 'function',
+		name: t.name,
+		description: t.description,
+		parameters: toGeminiParameters(t.schema),
+	}));
 
 	if (this.getNode().typeVersion === 1) {
 		if (options.codeExecution) {
-			tools.push({
-				codeExecution: {},
-			});
+			tools.push({ type: 'code_execution' });
 		}
 	}
 
-	// Add built-in tools and build toolConfig
-	let toolConfig: GenerateContentRequest['toolConfig'];
 	if (this.getNode().typeVersion >= 1.1) {
 		if (builtInTools) {
 			if (builtInTools.googleSearch) {
-				tools.push({
-					googleSearch: {},
-				});
+				tools.push({ type: 'google_search' });
 			}
 
 			const googleMapsOptions = builtInTools.googleMaps;
 			if (googleMapsOptions) {
+				// latitude/longitude тепер задаються прямо в tool, а не через toolConfig.retrievalConfig
+				const { latitude, longitude } = googleMapsOptions;
+				const hasLocation =
+					latitude !== undefined && latitude !== '' && longitude !== undefined && longitude !== '';
 				tools.push({
-					googleMaps: {},
+					type: 'google_maps',
+					...(hasLocation && { latitude: Number(latitude), longitude: Number(longitude) }),
 				});
-
-				// Build toolConfig with retrievalConfig if latitude/longitude are provided
-				const latitude = googleMapsOptions.latitude;
-				const longitude = googleMapsOptions.longitude;
-				if (
-					latitude !== undefined &&
-					latitude !== '' &&
-					longitude !== undefined &&
-					longitude !== ''
-				) {
-					toolConfig = {
-						retrievalConfig: {
-							latLng: {
-								latitude: Number(latitude),
-								longitude: Number(longitude),
-							},
-						},
-					};
-				}
 			}
 
 			if (builtInTools.urlContext) {
-				tools.push({
-					urlContext: {},
-				});
+				tools.push({ type: 'url_context' });
 			}
 
 			const fileSearchOptions = builtInTools.fileSearch;
@@ -490,17 +391,14 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 				}
 
 				tools.push({
-					fileSearch: {
-						...(fileSearchStoreNames && { fileSearchStoreNames }),
-						...(metadataFilter && { metadataFilter }),
-					},
+					type: 'file_search',
+					...(fileSearchStoreNames && { file_search_store_names: fileSearchStoreNames }),
+					...(metadataFilter && { metadata_filter: metadataFilter }),
 				});
 			}
 
 			if (builtInTools.codeExecution) {
-				tools.push({
-					codeExecution: {},
-				});
+				tools.push({ type: 'code_execution' });
 			}
 		}
 	}
@@ -511,33 +409,31 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 			itemIndex: i,
 		});
 	}
-	const contents: Content[] = nonEmptyMessages.map((m) => ({
-		parts: [{ text: m.content }],
-		role: m.role,
-	}));
-	const body: GenerateContentRequest = {
-		tools,
-		contents,
-		generationConfig,
-		systemInstruction: options.systemMessage
-			? { parts: [{ text: options.systemMessage }] }
-			: undefined,
-		...(toolConfig && { toolConfig }),
+	// contents[{ role, parts }]  ->  steps: user_input / model_output
+	const input = nonEmptyMessages.map((m): InteractionStep => {
+		const text: InteractionTextContent = { type: 'text', text: m.content };
+		const content = [text];
+		return m.role === 'model' ? { type: 'model_output', content } : { type: 'user_input', content };
+	});
+
+	// tools / system_instruction / generation_config не успадковуються через
+	// previous_interaction_id, тому передаємо їх у кожному запиті
+	const baseBody = {
+		model,
+		...(tools.length && { tools }),
+		...(options.systemMessage && { system_instruction: options.systemMessage }),
+		...(jsonOutput && { response_format: { type: 'text', mime_type: 'application/json' } }),
+		...(Object.keys(generationConfig).length && { generation_config: generationConfig }),
 	};
 
-	let response = (await apiRequest.call(this, 'POST', `/v1beta/${model}:generateContent`, {
-		body,
-	})) as GenerateContentResponse;
+	let response = await createInteraction.call(this, { ...baseBody, input } as unknown as IDataObject);
 
 	const captureUsage = () => {
-		const usageMetadata = (response as unknown as Record<string, unknown>).usageMetadata as
-			| { promptTokenCount: number; candidatesTokenCount: number }
-			| undefined;
-		if (usageMetadata) {
+		if (response.usage) {
 			accumulateTokenUsage(
 				this,
-				usageMetadata.promptTokenCount,
-				usageMetadata.candidatesTokenCount,
+				response.usage.total_input_tokens ?? 0,
+				response.usage.total_output_tokens ?? 0,
 			);
 		}
 	};
@@ -556,67 +452,45 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 			break;
 		}
 
-		contents.push.apply(
-			contents,
-			response.candidates.map((c) => c.content),
-		);
-
-		for (const { functionCall } of toolCalls) {
-			let toolResponse;
-			for (const availableTool of availableTools) {
-				if (availableTool.name === functionCall.name) {
-					toolResponse = (await availableTool.invoke(functionCall.args)) as IDataObject;
-				}
+		const functionResults: FunctionResultStep[] = [];
+		for (const functionCall of toolCalls) {
+			const tool = availableTools.find((t) => t.name === functionCall.name);
+			if (!tool) {
+				functionResults.push({
+					type: 'function_result',
+					call_id: functionCall.id,
+					name: functionCall.name,
+					is_error: true,
+					result: `Tool '${functionCall.name}' is not available`,
+				});
+				continue;
 			}
 
-			contents.push({
-				parts: [
-					{
-						functionResponse: {
-							id: functionCall.id,
-							name: functionCall.name,
-							response: {
-								result: toolResponse,
-							},
-						},
-					},
-				],
-				role: 'tool',
+			const toolResponse = await tool.invoke(functionCall.arguments);
+			functionResults.push({
+				type: 'function_result',
+				call_id: functionCall.id,
+				name: functionCall.name,
+				result:
+					typeof toolResponse === 'string' ? toolResponse : { result: toolResponse as IDataObject },
 			});
 		}
 
-		response = (await apiRequest.call(this, 'POST', `/v1beta/${model}:generateContent`, {
-			body,
-		})) as GenerateContentResponse;
+		// Історію (включно з thought signatures) тримає сервер, тому шлемо лише результати.
+		// Це вимагає store=true (значення за замовчуванням).
+		response = await createInteraction.call(this, {
+			...baseBody,
+			previous_interaction_id: response.id,
+			input: functionResults,
+		} as unknown as IDataObject);
 		captureUsage();
 		toolCalls = getToolCalls(response);
 		currentIteration++;
 	}
 
-	const candidates = options.includeMergedResponse
-		? response.candidates.map((candidate) => ({
-				...candidate,
-				mergedResponse: (candidate?.content?.parts ?? [])
-					.filter(isTextPart)
-					.map((part) => part.text)
-					.join(''),
-			}))
-		: response.candidates;
-
 	if (simplify) {
-		return candidates.map((candidate) => ({
-			json: candidate,
-			pairedItem: { item: i },
-		}));
+		return [{ json: { text: getOutputText(response) }, pairedItem: { item: i } }];
 	}
 
-	return [
-		{
-			json: {
-				...response,
-				candidates,
-			},
-			pairedItem: { item: i },
-		},
-	];
+	return [{ json: response as unknown as IDataObject, pairedItem: { item: i } }];
 }

@@ -19,6 +19,7 @@ export type InteractionContent = Interactions.Content;
 export type InteractionTextContent = Interactions.TextContent;
 export type InteractionModelOutputStep = Interactions.ModelOutputStep;
 export type InteractionGenerationConfig = Interactions.GenerationConfig;
+export type InteractionTool = Interactions.Tool;
 
 /* ------------------------------------------------------------------ */
 /* generateContent (старі типи) — лишаємо, поки інші операції на них  */

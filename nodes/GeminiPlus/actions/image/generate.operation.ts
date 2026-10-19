@@ -2,11 +2,11 @@ import type { IExecuteFunctions, INodeExecutionData, INodeProperties } from 'n8n
 import { NodeOperationError, updateDisplayOptions } from 'n8n-workflow';
 
 import {
-	type GenerateContentRequest,
-	type GenerateContentResponse,
-	type ImagenResponse,
-	Modality,
-} from '../../helpers/interfaces';
+	createInteraction,
+	getOutputImages,
+	toInteractionModel,
+} from '../../helpers/interactions';
+import type { ImagenResponse } from '../../helpers/interfaces';
 import { getFilenameFromMimeType } from '../../helpers/utils';
 import { apiRequest } from '../../transport';
 import { modelRLC } from '../descriptions';
@@ -89,28 +89,16 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 	) as string;
 
 	if (model.includes('gemini')) {
-		const generationConfig = {
-			responseModalities: [Modality.IMAGE, Modality.TEXT],
-		};
-		const body: GenerateContentRequest = {
-			contents: [
-				{
-					role: 'user',
-					parts: [{ text: prompt }],
-				},
-			],
-			generationConfig,
-		};
+		const response = await createInteraction.call(this, {
+			model: toInteractionModel(model),
+			input: prompt,
+			response_modalities: ['image', 'text'],
+		});
 
-		const response = (await apiRequest.call(this, 'POST', `/v1beta/${model}:generateContent`, {
-			body,
-		})) as GenerateContentResponse;
-		const promises = response.candidates.map(async (candidate) => {
-			const imagePart = candidate.content.parts.find((part) => 'inlineData' in part);
-			const mimeType = imagePart?.inlineData.mimeType;
-			const fileName = getFilenameFromMimeType(mimeType, 'image', 'png');
-			const buffer = Buffer.from(imagePart?.inlineData.data ?? '', 'base64');
-			const binaryData = await this.helpers.prepareBinaryData(buffer, fileName, mimeType);
+		const promises = getOutputImages(response).map(async (image) => {
+			const fileName = getFilenameFromMimeType(image.mimeType, 'image', 'png');
+			const buffer = Buffer.from(image.data, 'base64');
+			const binaryData = await this.helpers.prepareBinaryData(buffer, fileName, image.mimeType);
 			return {
 				binary: {
 					[binaryPropertyOutput]: binaryData,

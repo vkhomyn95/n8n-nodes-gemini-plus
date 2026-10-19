@@ -1,9 +1,19 @@
-import type { IExecuteFunctions, INodeExecutionData, INodeProperties } from 'n8n-workflow';
+import type {
+	IDataObject,
+	IExecuteFunctions,
+	INodeExecutionData,
+	INodeProperties,
+} from 'n8n-workflow';
 import { NodeOperationError, updateDisplayOptions } from 'n8n-workflow';
 
-import type { GenerateContentResponse } from '../../helpers/interfaces';
+import {
+	createInteraction,
+	getOutputImages,
+	toInteractionContent,
+	toInteractionModel,
+} from '../../helpers/interactions';
+import type { InteractionContent } from '../../helpers/interfaces';
 import { getFilenameFromMimeType, uploadFile } from '../../helpers/utils';
-import { apiRequest } from '../../transport';
 import { modelRLC } from '../descriptions';
 
 interface ImagesParameter {
@@ -39,38 +49,6 @@ function isImagesParameter(param: unknown): param is ImagesParameter {
 		return (
 			typeof itemObj.binaryPropertyName === 'string' || itemObj.binaryPropertyName === undefined
 		);
-	});
-}
-
-function isGenerateContentResponse(response: unknown): response is GenerateContentResponse {
-	if (typeof response !== 'object' || response === null) {
-		return false;
-	}
-
-	const responseObj = response as Record<string, unknown>;
-
-	if (!('candidates' in responseObj) || !Array.isArray(responseObj.candidates)) {
-		return false;
-	}
-
-	return responseObj.candidates.every((candidate: unknown) => {
-		if (typeof candidate !== 'object' || candidate === null) {
-			return false;
-		}
-
-		const candidateObj = candidate as Record<string, unknown>;
-
-		if (
-			!('content' in candidateObj) ||
-			typeof candidateObj.content !== 'object' ||
-			candidateObj.content === null
-		) {
-			return false;
-		}
-
-		const contentObj = candidateObj.content as Record<string, unknown>;
-
-		return 'parts' in contentObj && Array.isArray(contentObj.parts);
 	});
 }
 
@@ -151,7 +129,7 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 	}
 	let model = this.getNodeParameter('modelId', i, '', { extractValue: true }) as string;
 	if (!model) {
-		model = 'models/gemini-2.5-flash-image-preview';
+		model = 'gemini-2.5-flash-image';
 	}
 
 	const binaryPropertyOutput = this.getNodeParameter('options.binaryPropertyOutput', i, 'edited');
@@ -171,54 +149,30 @@ export async function execute(this: IExecuteFunctions, i: number): Promise<INode
 		.map((v) => v.binaryPropertyName)
 		.filter((n): n is string => Boolean(n));
 
-	// Upload all images and gather fileData parts
-	const fileParts = [] as Array<{ fileData: { fileUri: string; mimeType: string } }>;
+	// Upload all images and gather input content blocks
+	const imageContents: InteractionContent[] = [];
 	for (const fieldName of imageFieldNames) {
 		const bin = this.helpers.assertBinaryData(i, fieldName);
 		const buf = await this.helpers.getBinaryDataBuffer(i, fieldName);
 		const uploaded = await uploadFile.call(this, buf, bin.mimeType);
-		fileParts.push({ fileData: { fileUri: uploaded.fileUri, mimeType: uploaded.mimeType } });
+		imageContents.push(toInteractionContent(uploaded.fileUri, uploaded.mimeType));
 	}
 
-	const generationConfig = {
-		responseModalities: ['IMAGE'],
-	};
+	const response = await createInteraction.call(this, {
+		model: toInteractionModel(model),
+		input: [...imageContents, { type: 'text', text: prompt }],
+		response_modalities: ['image'],
+	} as unknown as IDataObject);
 
-	const body = {
-		contents: [
-			{
-				role: 'user',
-				parts: [...fileParts, { text: prompt }],
-			},
-		],
-		generationConfig,
-	};
-
-	const response: unknown = await apiRequest.call(
-		this,
-		'POST',
-		`/v1beta/${model}:generateContent`,
-		{
-			body,
-		},
-	);
-
-	if (!isGenerateContentResponse(response)) {
-		throw new Error('Invalid response format from Gemini API');
+	const images = getOutputImages(response);
+	if (!images.length) {
+		throw new Error('No image data returned from Gemini API');
 	}
 
-	const promises = response.candidates.map(async (candidate) => {
-		const imagePart = candidate.content.parts.find((part) => 'inlineData' in part);
-
-		// Check if imagePart exists and has inlineData with actual data
-		if (!imagePart?.inlineData?.data) {
-			throw new Error('No image data returned from Gemini API');
-		}
-
-		const mimeType = imagePart.inlineData.mimeType;
-		const fileName = getFilenameFromMimeType(mimeType, 'image', 'png');
-		const bufferOut = Buffer.from(imagePart.inlineData.data, 'base64');
-		const binaryOut = await this.helpers.prepareBinaryData(bufferOut, fileName, mimeType);
+	const promises = images.map(async (image) => {
+		const fileName = getFilenameFromMimeType(image.mimeType, 'image', 'png');
+		const bufferOut = Buffer.from(image.data, 'base64');
+		const binaryOut = await this.helpers.prepareBinaryData(bufferOut, fileName, image.mimeType);
 		return {
 			binary: {
 				[outputKey]: binaryOut,
